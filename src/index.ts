@@ -23,10 +23,12 @@ import {
   NativeFormatter,
   OpenAIResponsesAPIAdapter,
   OpenAIResponsesFormatter,
+  OpenAICompatibleAdapter,
   OpenRouterAdapter,
 } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter } from './logging-adapter.js';
 import { LoggingProviderAdapter } from './logging-provider-wrapper.js';
+import { gateTelemetryHeaders } from './gate-telemetry.js';
 import { LoggingBedrockAdapter } from './logging-bedrock-adapter.js';
 import { CodexSubscriptionAdapter } from './codex-subscription-adapter.js';
 import { CallLedger } from './call-ledger.js';
@@ -83,6 +85,10 @@ const config = {
   authToken: process.env.ANTHROPIC_AUTH_TOKEN,
   openaiApiKey: process.env.OPENAI_API_KEY,
   openrouterApiKey: process.env.OPENROUTER_API_KEY,
+  // Deliberately NO fallback to OPENAI_API_KEY: agent.baseUrl is
+  // recipe-controlled, so a fallback would silently send a real OpenAI
+  // credential as a Bearer token to whatever endpoint a recipe names.
+  openaiCompatibleApiKey: process.env.OPENAI_COMPATIBLE_API_KEY,
   codexBinary: process.env.CODEX_BINARY,
   model: process.env.MODEL,
   dataDir: process.env.DATA_DIR || './data',
@@ -876,6 +882,16 @@ async function main() {
         fastMode: recipe.agent.codex?.fastMode ?? false,
       })
     : undefined;
+  // Generic OpenAI-compatible chat-completions endpoint (Ollama, vLLM, Together,
+  // Groq, NanoGPT, ...). The recipe carries the endpoint (agent.baseUrl,
+  // validated at load); the key is optional because local servers have none.
+  const openaiCompatibleAdapter = provider === 'openai-compatible'
+    ? new OpenAICompatibleAdapter({
+        baseURL: recipe.agent.baseUrl!,
+        apiKey: config.openaiCompatibleApiKey || undefined,
+        providerName: 'openai-compatible',
+      })
+    : undefined;
   const openrouterAdapter = provider === 'openrouter'
     ? new OpenRouterAdapter({
         apiKey: config.openrouterApiKey!,
@@ -920,6 +936,33 @@ async function main() {
           : {}),
       })
     : undefined;
+  // -- x-gate-debt-chunks stamp (membrane dynamicHeaders, antra-tess/membrane#65)
+  // The gate records compression-debt per ledger row; debt only changes at
+  // calls, so the per-call series is its full-resolution history ("spoke ->
+  // chunk appeared -> chewed" vs "solver repacked -> queue spiked"). The value
+  // is the SAME reduction /healthz reports (cm getCompressionDebt). Late-bound
+  // through appRef because the framework outlives adapter construction and is
+  // replaced on session switch. Whenever it is unreadable — no framework yet,
+  // multi-agent process (whose debt would we even claim?), no strategy — the
+  // header is simply not sent: an unstamped call is honest, a guessed one lies.
+  let appRefForDebt: AppContext | null = null;
+  const pendingDebtChunks = (): number | null => {
+    try {
+      const agents = appRefForDebt?.framework.getAllAgents() ?? [];
+      if (agents.length !== 1) return null;
+      const strategy = (agents[0] as unknown as {
+        getContextManager?: () => { getStrategy?: () => { getCompressionDebt?: () => unknown } };
+      }).getContextManager?.()?.getStrategy?.();
+      const d = strategy?.getCompressionDebt?.() as { pendingChunks?: unknown } | undefined;
+      const n = d?.pendingChunks;
+      return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const gateTelemetryDynamicHeaders = gateTelemetryHeaders(process.env, pendingDebtChunks);
+
   const adapter = provider === 'openai-responses'
     ? new LoggingProviderAdapter(
         new OpenAIResponsesAPIAdapter({
@@ -936,6 +979,7 @@ async function main() {
     : bedrockAdapter
       ?? (mockAdapter ? new LoggingProviderAdapter(mockAdapter, llmLogPath) : undefined)
       ?? (openrouterAdapter ? new LoggingProviderAdapter(openrouterAdapter, llmLogPath) : undefined)
+      ?? (openaiCompatibleAdapter ? new LoggingProviderAdapter(openaiCompatibleAdapter, llmLogPath) : undefined)
       ?? (codexAdapter ? new LoggingProviderAdapter(codexAdapter, llmLogPath) : undefined)
       ?? new LoggingAnthropicAdapter(
         {
@@ -957,6 +1001,15 @@ async function main() {
                   : {}),
               }),
           baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+          // Double-gated (see src/gate-telemetry.ts): GATE_TELEMETRY=1 AND a
+          // configured base URL, so the stamp can only ever go to a
+          // gateway the operator has declared — never to the vendor's
+          // default endpoint (review finding on the first wiring).
+          // Cast note: @animalabs/membrane on npm (0.5.80) predates the
+          // dynamicHeaders field (antra-tess/membrane#65); drop the cast when
+          // the release lands. Harmless either way — an older membrane
+          // ignores unknown config keys.
+          ...(gateTelemetryDynamicHeaders ? ({ dynamicHeaders: gateTelemetryDynamicHeaders } as object) : {}),
           // Hold this agent's cached prefix warm across idle gaps. Only fires
           // when the entry is actually near expiry, so a busy agent costs
           // nothing; only the 1h-TTL primary lane is eligible (the module
@@ -1068,6 +1121,8 @@ async function main() {
       getWebUiModule(this.framework)?.setApp(this);
     },
   };
+
+  appRefForDebt = app;
 
   // Off-path refusal dragnet → ops alerts (observability M3): refusals on
   // non-streamed calls (compression/summarizer drains, maintenance) never

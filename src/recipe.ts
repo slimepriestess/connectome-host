@@ -56,6 +56,12 @@ export interface RecipeStrategy {
    * recall, or non-target raw recent material). One call, not a refusal
    * ladder. Source-preserving; L1 only. Default off. */
   compressionSourceOnly?: boolean;
+  /** Preserve canonical + recall variants, then issue one source-only L1 request last. */
+  compressionSourceOnlyFallback?: boolean;
+  /** Legacy first-choice target-only merge request. */
+  compressionMergeSourceOnly?: boolean;
+  /** Preserve ordinary merge retries, then use target-only on the final attempt. */
+  compressionMergeSourceOnlyFallback?: boolean;
   /** Token budget for prior recall-pair context in compression/merge
    * requests (Context Manager `compressionRecallBudgetTokens`). */
   compressionRecallBudgetTokens?: number;
@@ -87,7 +93,10 @@ export interface RecipeStrategy {
   /** Adaptive-resolution fold planner. The host defaults this to 'kv-stable'
    *  (cache-stable compile plans; see buildFrameworkStrategy) — set explicitly
    *  only to opt into the legacy planners. */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable' | 'kv-unified';
+  /** Complete fail-closed policy for the kv-unified solver. No live defaults
+   * are supplied: selecting kv-unified without every field is invalid. */
+  kvUnified?: RecipeKvUnifiedConfig;
   speculativeProduction?: boolean;
   /** L1 production holdback: keep the newest N closed chunks out of the
    *  speculative compression queue (default 1); demand still overrides. */
@@ -115,6 +124,32 @@ export interface RecipeStrategy {
   identityReminder?: string;
 }
 
+export interface RecipeKvUnifiedConfig {
+  policy: {
+    alpha: number;
+    budgetLowRatio: number;
+    budgetHighRatio: number;
+    budgetUnderLambda: number;
+    budgetOverLambda: number;
+    cacheLambda: number;
+    cacheScale: number;
+    cacheReadPrice: number;
+    cacheWritePrice: number;
+    continuityLambda: number;
+    continuityScale: number;
+    continuityRecencyHalfLifeTokens: number;
+    continuityRecencyFloor: number;
+    continuityStableHalfLife: number;
+    continuityStableFloor: number;
+  };
+  tokenBucketSize: number;
+  continuityBucketSize: number;
+  fidelityBucketSize: number;
+  labelCeiling: number;
+  adoptEpsilon: number;
+  treeifyNonContiguousSummaries: boolean;
+}
+
 export interface RecipeAgent {
   name?: string;
   model?: string;
@@ -123,7 +158,19 @@ export interface RecipeAgent {
   /** Provider transport. Omitted preserves the historical Anthropic default.
    * 'mock' wires membrane's MockAdapter — canned/echo responses, no API key,
    * no provider spend; for exercising the full host loop offline. */
-  provider?: 'anthropic' | 'openai-responses' | 'openai-codex' | 'openrouter' | 'bedrock' | 'mock';
+  provider?: 'anthropic' | 'openai-responses' | 'openai-codex' | 'openrouter' | 'bedrock' | 'openai-compatible' | 'mock';
+  /**
+   * Base URL of an OpenAI-compatible chat-completions endpoint, e.g.
+   * `http://localhost:11434/v1` (Ollama), a vLLM server, Together, Groq,
+   * NanoGPT... Required with `provider: 'openai-compatible'`, rejected with
+   * any other provider (those have their own `*_BASE_URL` env overrides).
+   * The API key comes from `OPENAI_COMPATIBLE_API_KEY` only — deliberately no
+   * `OPENAI_API_KEY` fallback, since `baseUrl` is recipe-controlled and a real
+   * OpenAI credential must never travel silently to an arbitrary endpoint.
+   * Local servers may need none. `agent.model` is required
+   * too — there is no sensible default model for an arbitrary endpoint.
+   */
+  baseUrl?: string;
   /** Message formatter. 'native' (default) = structured user/assistant turns.
    * 'anthropic-xml' = classic prefill format ("participant: text" runs, XML
    * tools) — for migrating prefill-era bots (chapterx borgs) with their exact
@@ -1137,6 +1184,87 @@ async function resolveSystemPrompt(recipe: Recipe): Promise<Recipe> {
   return recipe;
 }
 
+function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
+  const selected = strategy.foldingStrategy === 'kv-unified';
+  const raw = strategy.kvUnified;
+  if (!selected) {
+    if (raw !== undefined) {
+      throw new Error('Recipe agent.strategy.kvUnified requires foldingStrategy "kv-unified".');
+    }
+    return;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(
+      'Recipe foldingStrategy "kv-unified" requires a complete agent.strategy.kvUnified object; defaults are forbidden.',
+    );
+  }
+  const config = raw as Record<string, unknown>;
+  if (!config.policy || typeof config.policy !== 'object' || Array.isArray(config.policy)) {
+    throw new Error('Recipe agent.strategy.kvUnified.policy must be a complete object.');
+  }
+  const policy = config.policy as Record<string, unknown>;
+  const policyNumbers = [
+    'alpha', 'budgetLowRatio', 'budgetHighRatio', 'budgetUnderLambda',
+    'budgetOverLambda', 'cacheLambda', 'cacheScale', 'cacheReadPrice',
+    'cacheWritePrice', 'continuityLambda', 'continuityScale',
+    'continuityRecencyHalfLifeTokens', 'continuityRecencyFloor',
+    'continuityStableHalfLife', 'continuityStableFloor',
+  ] as const;
+  for (const key of policyNumbers) {
+    if (typeof policy[key] !== 'number' || !Number.isFinite(policy[key])) {
+      throw new Error(`Recipe agent.strategy.kvUnified.policy.${key} must be a finite number.`);
+    }
+  }
+  const nonNegative = [
+    'alpha', 'budgetUnderLambda', 'budgetOverLambda', 'cacheLambda',
+    'cacheReadPrice', 'cacheWritePrice', 'continuityLambda',
+  ] as const;
+  for (const key of nonNegative) {
+    if ((policy[key] as number) < 0) {
+      throw new Error(`Recipe agent.strategy.kvUnified.policy.${key} must be non-negative.`);
+    }
+  }
+  for (const key of [
+    'cacheScale', 'continuityScale', 'continuityRecencyHalfLifeTokens',
+    'continuityStableHalfLife',
+  ] as const) {
+    if ((policy[key] as number) <= 0) {
+      throw new Error(`Recipe agent.strategy.kvUnified.policy.${key} must be positive.`);
+    }
+  }
+  const low = policy.budgetLowRatio as number;
+  const high = policy.budgetHighRatio as number;
+  if (low < 0 || high > 1 || low > high) {
+    throw new Error('Recipe kvUnified budget ratios must satisfy 0 <= low <= high <= 1.');
+  }
+  for (const key of ['continuityRecencyFloor', 'continuityStableFloor'] as const) {
+    const value = policy[key] as number;
+    if (value < 0 || value > 1) {
+      throw new Error(`Recipe agent.strategy.kvUnified.policy.${key} must be in [0, 1].`);
+    }
+  }
+  for (const key of [
+    'tokenBucketSize', 'continuityBucketSize', 'fidelityBucketSize', 'labelCeiling',
+  ] as const) {
+    const value = config[key];
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`Recipe agent.strategy.kvUnified.${key} must be a positive safe integer.`);
+    }
+  }
+  if (
+    typeof config.adoptEpsilon !== 'number' ||
+    !Number.isFinite(config.adoptEpsilon) ||
+    config.adoptEpsilon < 0
+  ) {
+    throw new Error('Recipe agent.strategy.kvUnified.adoptEpsilon must be a finite non-negative number.');
+  }
+  if (typeof config.treeifyNonContiguousSummaries !== 'boolean') {
+    throw new Error(
+      'Recipe agent.strategy.kvUnified.treeifyNonContiguousSummaries must be an explicit boolean.',
+    );
+  }
+}
+
 /**
  * Validate raw JSON and fill defaults.
  */
@@ -1167,9 +1295,10 @@ export function validateRecipe(raw: unknown): Recipe {
       agent.provider !== 'openai-codex' &&
       agent.provider !== 'openrouter' &&
       agent.provider !== 'bedrock' &&
+      agent.provider !== 'openai-compatible' &&
       agent.provider !== 'mock') {
     throw new Error(
-      `Recipe agent.provider must be 'anthropic', 'openai-responses', 'openai-codex', 'openrouter', 'bedrock', or 'mock', ` +
+      `Recipe agent.provider must be 'anthropic', 'openai-responses', 'openai-codex', 'openrouter', 'bedrock', 'openai-compatible', or 'mock', ` +
       `got ${JSON.stringify(agent.provider)}.`,
     );
   }
@@ -1291,6 +1420,32 @@ export function validateRecipe(raw: unknown): Recipe {
         }
       }
     }
+  }
+
+  // openai-compatible: an endpoint the host knows nothing about, so the recipe
+  // must say where it is and which model to ask for. Fail at load time, not as
+  // a fetch to 'undefined/chat/completions' at first inference.
+  if (agent.provider === 'openai-compatible') {
+    if (typeof agent.baseUrl !== 'string' || !agent.baseUrl.trim()) {
+      throw new Error("Recipe agent.baseUrl is required when agent.provider is 'openai-compatible' (e.g. \"http://localhost:11434/v1\").");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(agent.baseUrl);
+    } catch {
+      throw new Error(`Recipe agent.baseUrl must be an absolute http(s) URL, got ${JSON.stringify(agent.baseUrl)}.`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`Recipe agent.baseUrl must use http or https, got ${JSON.stringify(agent.baseUrl)}.`);
+    }
+    if (typeof agent.model !== 'string' || !agent.model.trim()) {
+      throw new Error("Recipe agent.model is required when agent.provider is 'openai-compatible' (no default model for an arbitrary endpoint).");
+    }
+  } else if (agent.baseUrl !== undefined) {
+    throw new Error(
+      `Recipe agent.baseUrl only applies to agent.provider 'openai-compatible' (got provider ${JSON.stringify(agent.provider ?? 'anthropic')}); ` +
+      'other providers take their endpoint from ANTHROPIC_BASE_URL / OPENAI_BASE_URL / BEDROCK_BASE_URL.',
+    );
   }
 
   // A keepalive that fires AFTER the entry has already expired is the worst of
@@ -1418,6 +1573,21 @@ export function validateRecipe(raw: unknown): Recipe {
       );
     }
     if (
+      strategy.foldingStrategy !== undefined &&
+      strategy.foldingStrategy !== 'flat-profile' &&
+      strategy.foldingStrategy !== 'oldest-first' &&
+      strategy.foldingStrategy !== 'kv-stable' &&
+      strategy.foldingStrategy !== 'kv-unified'
+    ) {
+      throw new Error(
+        `Recipe agent.strategy.foldingStrategy is invalid: ${JSON.stringify(strategy.foldingStrategy)}.`,
+      );
+    }
+    if (strategy.foldingStrategy === 'kv-unified' && strategy.type === 'passthrough') {
+      throw new Error('Recipe foldingStrategy "kv-unified" requires an autobiographical or frontdesk strategy.');
+    }
+    validateKvUnifiedConfig(strategy);
+    if (
       strategy.compressionRefusalCurveFallbacks !== undefined
       && (
         typeof strategy.compressionRefusalCurveFallbacks !== 'number'
@@ -1437,11 +1607,15 @@ export function validateRecipe(raw: unknown): Recipe {
     ) {
       throw new Error('Recipe agent.strategy.compressionContextBudgetTokens must be a positive safe integer.');
     }
-    if (
-      strategy.compressionSourceOnly !== undefined
-      && typeof strategy.compressionSourceOnly !== 'boolean'
-    ) {
-      throw new Error('Recipe agent.strategy.compressionSourceOnly must be a boolean.');
+    for (const key of [
+      'compressionSourceOnly',
+      'compressionSourceOnlyFallback',
+      'compressionMergeSourceOnly',
+      'compressionMergeSourceOnlyFallback',
+    ] as const) {
+      if (strategy[key] !== undefined && typeof strategy[key] !== 'boolean') {
+        throw new Error(`Recipe agent.strategy.${key} must be a boolean.`);
+      }
     }
     if (
       strategy.compressionRecallBudgetTokens !== undefined
